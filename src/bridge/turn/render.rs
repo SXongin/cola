@@ -2150,6 +2150,34 @@ fn hand_over_absorbed_wakes(
     }
 }
 
+/// The Session Sync half of issue #1087's floor (the render walk's half is
+/// [`hand_over_absorbed_wakes`]): a terminal chain card that already SHOWS the
+/// newest completion Wake's work was handed that work over when it rendered, so
+/// re-asking the same content diff here records the handoff for any card the
+/// render walk never marked — one written before that mark existed, or whose
+/// work reached it through a venue that placed no part. Without it the card
+/// would read as a genuine un-handed-over resumption and the Fresh arm would
+/// re-post work the card already carries. A restart/interrupt Wake is
+/// deliberately outside this floor (ADR-0066 keeps its 承接 split), and a Wake
+/// the card already handed over is a no-op.
+pub(super) fn hand_over_absorbed_wake(
+    card: &mut state::CardSession,
+    transcript: &SessionTranscript,
+    read_positions: &std::collections::HashMap<&str, usize>,
+    newest_wake: Option<&Wake>,
+    bound: Option<usize>,
+) {
+    if card.is_chain_card()
+        && !card.is_running()
+        && let Some(wake) = newest_wake
+        && wake.source.is_completion()
+        && !card.acc.has_handed_over_wake(wake.id.as_str())
+        && wake_work_covered(&card.acc, transcript, read_positions, wake, bound)
+    {
+        card.acc.hand_over_wake(wake.id.as_str());
+    }
+}
+
 /// Whether this card already SHOWS the work the Wake's resumption produced
 /// (issue #1087, ADR-0066): the Fresh probe's own content diff
 /// ([`renders_new_content`]) run against THIS card's rendered state instead of
@@ -2192,9 +2220,19 @@ pub(super) fn wake_work_covered(
 /// check), its message is at/after the card's delivered frontier, its own text
 /// is not already on the timeline, and its entry was neither announced nor
 /// handed over — so a notice the card already shows never resumes it twice.
+///
+/// A run whose **Evidence** ending is already recorded — or announced by this
+/// chain for a retirement committed in this life — has no completion entry to
+/// render at all ([`plan_wake_entries`] suppresses it as the same fact twice,
+/// issue #659), so its notice is not content either. The two gates and the run
+/// key are the plan's own ([`wake_run`]), so the probe and the plan cannot
+/// disagree: counting the notice would resume the card with the resuming header
+/// and an empty body (#1229).
 pub(super) fn wake_renders_new_content(
     acc: &StreamAccumulator,
+    transcript: &SessionTranscript,
     read_positions: &std::collections::HashMap<&str, usize>,
+    facts: &EndingFacts,
     wake: &Wake,
     bound: Option<usize>,
 ) -> bool {
@@ -2213,6 +2251,20 @@ pub(super) fn wake_renders_new_content(
         .wake_floor()
         .zip(wake.created_ms)
         .is_some_and(|(floor, created)| created <= floor)
+    {
+        return false;
+    }
+    // The same Evidence-class suppression [`plan_wake_entries`] applies before
+    // it builds the entry (issue #659, #1229): the retirement already claims the
+    // run ended, so the notice's entry is the same fact twice and renders
+    // nothing. Same run key ([`wake_run`]), same two gates — the durable record
+    // and this chain's announce set — so the gate LOGIC cannot diverge. The plan
+    // reads the facts again under the write lock; an ending recorded in that gap
+    // is the bounded residue, not a second rule.
+    let retired = wake_retired_task(wake, transcript);
+    if let Some(run) = wake_run(wake, retired.as_ref())
+        && (facts.recorded(&run, TaskEndingClass::Evidence)
+            || acc.ending_announced(&run, TaskEndingClass::Evidence))
     {
         return false;
     }

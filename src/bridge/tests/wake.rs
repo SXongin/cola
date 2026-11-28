@@ -4793,6 +4793,113 @@ async fn a_job_notice_alone_resumes_a_yielded_card() {
     );
 }
 
+/// Issue #1229: a job whose run already carries its durable
+/// **Evidence** ending (`已失联`) has no completion entry left to render —
+/// [`plan_wake_entries`](crate::bridge::turn::render) suppresses it as the same
+/// fact twice (issue #659). The notice alone is then NOT new content: resuming
+/// the yielded card would paint 「后台任务完成，继续处理中」 and render nothing
+/// under it. The Wake probe must apply the same Evidence gate, with the same
+/// run key, so it and the plan cannot disagree.
+#[tokio::test]
+async fn a_job_notice_for_an_evidence_ended_run_does_not_resume_the_card() {
+    const JOB: &str = "video_job_lost";
+    const PATH: &str = "/tmp/out/lost.mp4";
+    let _wd = test_work_dir();
+    let yielding = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_lost", JOB, PATH),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![live_video_job(1_500, JOB, PATH)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![yielding], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "生成一个视频"))
+        .await
+        .unwrap();
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Waiting),
+        "the live video job yields the card"
+    );
+
+    let (wake, notice) = video_notice(2_900, JOB, PATH);
+    // The runtime already declared the run lost: the durable Evidence ending is
+    // recorded BEFORE the late notice reaches the read, exactly as a process
+    // that saw `已失联` and then a `completed` notice would.
+    let run = crate::backend::runs::RunKey::of_wake(&wake).expect("the job Wake names its run");
+    cards.chains.record_ending(
+        "ses_test",
+        &run,
+        crate::backend::runs::TaskEnding {
+            class: crate::backend::runs::TaskEndingClass::Evidence,
+            state: crate::backend::runs::TaskEndingState::Shown,
+            finished_at: Some(2_500),
+            evidence: None,
+            identity: crate::backend::runs::TaskRunIdentity {
+                tool: Some("video".into()),
+                call_id: Some("call_lost".into()),
+                started_at: Some(1_500),
+                label: Some(PATH.into()),
+                ..Default::default()
+            },
+        },
+    );
+
+    let read = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_lost", JOB, PATH),
+        notice,
+    ])
+    // No execution boundary past the yield: this read is the notice alone, not
+    // the run's true end, so the yielded refresh cannot settle the card either —
+    // the only thing that could have moved it is the (suppressed) resume.
+    .with_executions(vec![execution(2_500)])
+    .with_wakes(vec![wake]);
+    // The notice is the ONLY new content: no assistant message follows it, so
+    // the Turn window cannot render anything on its own.
+    assert!(
+        read.turn_for_user(&turn_anchor(1_000))
+            .messages
+            .iter()
+            .all(|message| message.time.is_some_and(|time| time.created < 2_900)),
+        "no assistant content after the notice"
+    );
+    assert!(
+        Turn::wake_continuation(
+            &cards,
+            "ses_test",
+            &read,
+            &turn_anchor(1_000),
+            crate::backend::AgentCapabilities::full(),
+        )
+        .await
+        .is_none(),
+        "an Evidence-ended run's notice has no entry to render, so it owes no resume"
+    );
+
+    // The sync pass reaches the same verdict: the yielded card keeps its wait
+    // and is never repainted with the resuming header over an empty body.
+    script_transcript(&backend, vec![read]).await;
+    spawn_sync(&app);
+    wait_for_transcript_reads(&backend, "ses_test", 3).await;
+    assert!(
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("后台任务完成，继续处理中")),
+        "no empty resume header on the yielded card: {:?}",
+        platform.updated_cards().await
+    );
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Waiting),
+        "the card keeps its wait"
+    );
+}
+
 /// A Wake's Fresh arm must not replace a terminal card that still carries a
 /// live Permission/Question: the takeover would collect the old card and strip
 /// the only answerable controls (ADR-0100).

@@ -256,17 +256,21 @@ pub(crate) struct ContinuationFacts<'a> {
 /// or the newest Wake's OWN content (issue #1229) — a job's `synthetic`
 /// `<background-result>` notice is in no Turn window, so without it an open
 /// yielded card with no assistant follow-up reads as "nothing new" and drops the
-/// notice. A Wake the card already announced or took over never counts twice.
+/// notice. A Wake the card already announced or took over never counts twice,
+/// and neither does a notice whose completion entry the run's recorded
+/// **Evidence** ending suppresses — no entry means no content, so no empty
+/// resume.
 fn continuation_owes_render(
     acc: &StreamAccumulator,
     transcript: &SessionTranscript,
     anchor: &TurnAnchor,
     positions: &std::collections::HashMap<&str, usize>,
+    facts: &crate::bridge::chain::EndingFacts,
     newest_wake: Option<&crate::backend::Wake>,
     bound: Option<usize>,
 ) -> bool {
-    let wake_renders =
-        newest_wake.is_some_and(|wake| render::wake_renders_new_content(acc, positions, wake, bound));
+    let wake_renders = newest_wake
+        .is_some_and(|wake| render::wake_renders_new_content(acc, transcript, positions, facts, wake, bound));
     wake_renders || render::renders_new_content(acc, transcript, anchor, bound)
 }
 
@@ -703,15 +707,7 @@ impl Turn {
             // resumption and the Fresh arm would re-post work the card already
             // carries. A restart/interrupt Wake is deliberately outside this
             // floor: ADR-0066 keeps its 承接 split, rendered work or not.
-            if card.is_chain_card()
-                && !card.is_running()
-                && let Some(wake) = newest_wake
-                && wake.source.is_completion()
-                && !card.acc.has_handed_over_wake(wake.id.as_str())
-                && render::wake_work_covered(&card.acc, transcript, &positions, wake, bound)
-            {
-                card.acc.hand_over_wake(wake.id.as_str());
-            }
+            render::hand_over_absorbed_wake(&mut card, transcript, &positions, newest_wake, bound);
             not_live = !card.is_running();
             // A terminal card with a genuine un-handed-over Wake is not the
             // chain this Wake continues: skip the chain arms and let the Fresh
@@ -731,7 +727,20 @@ impl Turn {
                 // same-life card's anchor is the user message's, so the common
                 // path is unchanged.
                 let anchor = card.acc.turn_anchor().unwrap_or(turn_anchor);
-                if !continuation_owes_render(&card.acc, transcript, anchor, &positions, newest_wake, bound) {
+                // The probe and the entry plan share the Evidence gate pair and
+                // the run key (#1229); the plan reads the facts again under the
+                // write lock, so an ending recorded in that gap can still
+                // suppress the entry after this probe passed — a bounded
+                // residue, not a divergence in the gate logic.
+                if !continuation_owes_render(
+                    &card.acc,
+                    transcript,
+                    anchor,
+                    &positions,
+                    &render::Endings::of(cards, session_id).facts(),
+                    newest_wake,
+                    bound,
+                ) {
                     return None;
                 }
                 // An OPEN yielded card resumes IN PLACE (ADR-0066), so no second
